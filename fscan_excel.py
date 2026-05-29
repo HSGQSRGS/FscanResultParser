@@ -1,0 +1,694 @@
+#!/usr/bin/env python3
+"""
+Fscan Result Parser - Enhanced Edition
+A robust, modular tool for parsing fscan scanning results with extended features.
+Supports multiple input files, output formats, caching, filtering, and statistical reporting.
+
+Dependencies:
+    pandas>=1.3.0, openpyxl>=3.0.0 (for Excel export)
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import pickle
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Configuration & Constants
+# ---------------------------------------------------------------------------
+SUPPORTED_INPUT_ENCODINGS = ['utf-8', 'gbk', 'gb2312', 'latin-1']
+SUPPORTED_OUTPUT_FORMATS = ['excel', 'csv', 'json', 'txt']
+DEFAULT_OUTPUT_FORMAT = 'excel'
+CACHE_DIR_DEFAULT = Path.home() / '.fscan_parser_cache'
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+
+# ---------------------------------------------------------------------------
+# Custom Exceptions
+# ---------------------------------------------------------------------------
+class ParseError(Exception):
+    """Raised when the input file cannot be parsed correctly."""
+
+
+class ExportError(Exception):
+    """Raised when export to a specific format fails."""
+
+
+# ---------------------------------------------------------------------------
+# Filter & Rule Management
+# ---------------------------------------------------------------------------
+class FilterRule:
+    """
+    Represents a filtering rule.
+    Supports include/exclude by IP subnet, port range, or asset type prefix.
+    """
+    def __init__(self,
+                 include_subnets: Optional[List[str]] = None,
+                 exclude_subnets: Optional[List[str]] = None,
+                 include_ports: Optional[List[str]] = None,
+                 exclude_ports: Optional[List[str]] = None,
+                 include_types: Optional[List[str]] = None,
+                 exclude_types: Optional[List[str]] = None):
+        self.include_subnets = include_subnets or []
+        self.exclude_subnets = exclude_subnets or []
+        self.include_ports = include_ports or []
+        self.exclude_ports = exclude_ports or []
+        self.include_types = include_types or []  # e.g., '[*]', '[+]'
+        self.exclude_types = exclude_types or []
+
+    def matches(self, record: Dict[str, str]) -> bool:
+        """Check if a record passes all filters."""
+        ip = record.get('目的IP', '')   # internal field name kept for now; will be renamed in data flow
+        port = record.get('目的端口', '')
+        raw_info = record.get('资产信息', '')
+
+        # Check include subnets
+        if self.include_subnets:
+            if not any(self._ip_in_subnet(ip, subnet) for subnet in self.include_subnets):
+                return False
+        # Exclude subnets
+        if self.exclude_subnets:
+            if any(self._ip_in_subnet(ip, subnet) for subnet in self.exclude_subnets):
+                return False
+
+        # Port filtering (range or single)
+        if self.include_ports:
+            if not any(self._port_matches(port, p) for p in self.include_ports):
+                return False
+        if self.exclude_ports:
+            if any(self._port_matches(port, p) for p in self.exclude_ports):
+                return False
+
+        # Asset type filtering (prefix like '[*]' or '[+]')
+        if self.include_types:
+            if not any(raw_info.startswith(t) for t in self.include_types):
+                return False
+        if self.exclude_types:
+            if any(raw_info.startswith(t) for t in self.exclude_types):
+                return False
+
+        return True
+
+    @staticmethod
+    def _ip_in_subnet(ip: str, subnet: str) -> bool:
+        """Check if ip belongs to subnet (e.g., '192.168.1.0/24')."""
+        try:
+            parts = subnet.split('/')
+            network = parts[0]
+            mask = int(parts[1])
+            ip_parts = list(map(int, ip.split('.')))
+            net_parts = list(map(int, network.split('.')))
+            # Simple bitwise check
+            ip_int = (ip_parts[0] << 24) + (ip_parts[1] << 16) + (ip_parts[2] << 8) + ip_parts[3]
+            net_int = (net_parts[0] << 24) + (net_parts[1] << 16) + (net_parts[2] << 8) + net_parts[3]
+            mask_int = (0xFFFFFFFF << (32 - mask)) & 0xFFFFFFFF
+            return (ip_int & mask_int) == (net_int & mask_int)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _port_matches(port_str: str, rule: str) -> bool:
+        """Check if port (string) matches rule like '80', '1-1024'."""
+        try:
+            port = int(port_str)
+        except ValueError:
+            return False
+        if '-' in rule:
+            low, high = map(int, rule.split('-'))
+            return low <= port <= high
+        return port == int(rule)
+
+
+# ---------------------------------------------------------------------------
+# Cache Manager
+# ---------------------------------------------------------------------------
+class CacheManager:
+    """Handles caching of parse results using file hash + modification time."""
+
+    def __init__(self, cache_dir: Optional[Path] = None):
+        self.cache_dir = Path(cache_dir or CACHE_DIR_DEFAULT)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _file_fingerprint(self, file_path: Path) -> Optional[str]:
+        """Generate a unique fingerprint for a file."""
+        try:
+            stat = file_path.stat()
+            file_hash = hashlib.md5(file_path.read_bytes()).hexdigest()
+            return f"{file_hash}_{stat.st_mtime}"
+        except Exception:
+            return None
+
+    def load(self, file_path: Path) -> Optional[Any]:
+        """Load cached data for a file, if available."""
+        fingerprint = self._file_fingerprint(file_path)
+        if not fingerprint:
+            return None
+        cache_file = self.cache_dir / f"{fingerprint}.pkl"
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+            except Exception:
+                pass
+        return None
+
+    def save(self, file_path: Path, data: Any) -> None:
+        """Save data to cache."""
+        fingerprint = self._file_fingerprint(file_path)
+        if not fingerprint:
+            return
+        cache_file = self.cache_dir / f"{fingerprint}.pkl"
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Cache save failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Core Parser
+# ---------------------------------------------------------------------------
+class FscanParser:
+    """
+    Parses a single fscan output file, extracting asset and vulnerability records.
+    Maintains compatibility with original business logic (100% feature parity).
+    """
+
+    def __init__(self, filter_rule: Optional[FilterRule] = None):
+        # Precompiled regex patterns (original logic preserved)
+        self.url_pattern = re.compile(
+            r'(https?://)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::(\d+))?'
+        )
+        self.ip_port_pattern = re.compile(
+            r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)'
+        )
+        self.bare_ip_pattern = re.compile(
+            r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
+        )
+        self.invalid_line_patterns = [
+            re.compile(pat, re.IGNORECASE) for pat in [
+                r'Icmp\s+alive\s+hosts\s+len\s+is',
+                r'alive\s+ports\s+len\s+is',
+                r'扫描结束.*耗时',
+                r'LiveTop',
+                r'start\s+infoscan',
+                r'start\s+vulscan',
+                r'fscan\s+version',
+                r'\(icmp\)\s+Target.*is\s+alive'
+            ]
+        ]
+        self.filter_rule = filter_rule
+
+    @staticmethod
+    def _is_valid_ip(ip: str) -> bool:
+        """Validate IPv4 address (no leading zeros, correct range)."""
+        if not ip:
+            return False
+        parts = ip.split('.')
+        if len(parts) != 4:
+            return False
+        for part in parts:
+            if not part.isdigit():
+                return False
+            val = int(part)
+            if val < 0 or val > 255:
+                return False
+        return True
+
+    @staticmethod
+    def _is_valid_port(port: str) -> bool:
+        """Validate port number (empty string allowed)."""
+        if not port:
+            return True
+        try:
+            p = int(port)
+            return 0 <= p <= 65535
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _generate_24_subnet(ip: str) -> str:
+        """Generate /24 subnet from IP, if last octet is not 0."""
+        parts = ip.split('.')
+        if len(parts) == 4 and parts[3] != '0':
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+        return ""
+
+    def _extract_ip_port(self, line: str) -> Tuple[str, str]:
+        """
+        Extract IP and port using the original priority order:
+        1. URL with optional port
+        2. ip:port
+        3. bare IP
+        """
+        # 1. URL
+        match = self.url_pattern.search(line)
+        if match:
+            ip = match.group(2)
+            if self._is_valid_ip(ip) and ip.split('.')[3] != '0':
+                port = match.group(3)
+                if not port:
+                    scheme = match.group(1)
+                    port = '443' if scheme == 'https://' else '80'
+                return ip, port
+        # 2. IP:port
+        match = self.ip_port_pattern.search(line)
+        if match:
+            ip = match.group(1)
+            if self._is_valid_ip(ip) and ip.split('.')[3] != '0':
+                return ip, match.group(2)
+        # 3. bare IP
+        match = self.bare_ip_pattern.search(line)
+        if match:
+            ip = match.group(1)
+            if self._is_valid_ip(ip) and ip.split('.')[3] != '0':
+                return ip, ""
+        return "", ""
+
+    def _is_invalid_line(self, line: str) -> bool:
+        """Determine if a line is a statistical summary and should be skipped."""
+        for pat in self.invalid_line_patterns:
+            if pat.search(line):
+                return True
+        return False
+
+    def parse_file(self, file_path: Path) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        """
+        Parse the given file and return (assets, vulnerabilities).
+        Both are lists of dicts with keys: '源IP', '目的IP', '目的端口', '所在网段（x.x.x.x/24）', '资产信息'.
+        """
+        assets = []
+        vulns = []
+        valid_count = 0
+        discarded = 0
+        total_lines = 0
+
+        # Try multiple encodings
+        content_lines = None
+        used_encoding = None
+        for enc in SUPPORTED_INPUT_ENCODINGS:
+            try:
+                with open(file_path, 'r', encoding=enc) as f:
+                    content_lines = f.readlines()
+                used_encoding = enc
+                break
+            except (UnicodeDecodeError, FileNotFoundError):
+                continue
+        if content_lines is None:
+            # Fallback with ignore errors
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content_lines = f.readlines()
+                used_encoding = 'utf-8 (ignore errors)'
+            except Exception as e:
+                raise ParseError(f"Cannot read file {file_path}: {e}")
+
+        logger = logging.getLogger(__name__)
+        logger.info(f"Parsing {file_path} with encoding {used_encoding}, {len(content_lines)} lines")
+
+        for line_raw in content_lines:
+            line = line_raw.strip()
+            if not line:
+                continue
+            total_lines += 1
+            if self._is_invalid_line(line):
+                discarded += 1
+                continue
+            dest_ip, dest_port = self._extract_ip_port(line)
+            if not dest_ip or not self._is_valid_ip(dest_ip):
+                discarded += 1
+                continue
+            if not self._is_valid_port(dest_port):
+                discarded += 1
+                continue
+
+            subnet = self._generate_24_subnet(dest_ip)
+            record = {
+                '源IP': '',
+                '目的IP': dest_ip,
+                '目的端口': dest_port,
+                '所在网段（x.x.x.x/24）': subnet,
+                '资产信息': line
+            }
+
+            # Apply filters if defined
+            if self.filter_rule and not self.filter_rule.matches(record):
+                discarded += 1
+                continue
+
+            if line.startswith('[*]'):
+                assets.append(record)
+            elif line.startswith('[+]'):
+                vulns.append(record)
+            valid_count += 1
+            if valid_count % 1000 == 0:
+                logger.debug(f"Processed {valid_count} valid records...")
+
+        logger.info(
+            f"Parsed {file_path}: total {total_lines}, valid {valid_count}, discarded {discarded}, "
+            f"assets {len(assets)}, vulns {len(vulns)}"
+        )
+        return assets, vulns
+
+
+# ---------------------------------------------------------------------------
+# Statistical Report Generator
+# ---------------------------------------------------------------------------
+class ReportGenerator:
+    """Generates various statistics from parsed data."""
+
+    @staticmethod
+    def subnet_distribution(records: List[Dict[str, str]]) -> Dict[str, int]:
+        """Count records per /24 subnet."""
+        dist = {}
+        for rec in records:
+            subnet = rec.get('所在网段（x.x.x.x/24）', '')
+            if subnet:
+                dist[subnet] = dist.get(subnet, 0) + 1
+        return dist
+
+    @staticmethod
+    def port_distribution(records: List[Dict[str, str]]) -> Dict[str, int]:
+        """Count records per port."""
+        dist = {}
+        for rec in records:
+            port = rec.get('目的端口', 'none')
+            dist[port] = dist.get(port, 0) + 1
+        return dist
+
+    @staticmethod
+    def ip_distribution(records: List[Dict[str, str]]) -> Dict[str, int]:
+        """Count occurrences per IP."""
+        dist = {}
+        for rec in records:
+            ip = rec.get('目的IP', '')
+            if ip:
+                dist[ip] = dist.get(ip, 0) + 1
+        return dist
+
+    def generate_full_report(self, assets: List[Dict], vulns: List[Dict]) -> Dict:
+        """Generate a comprehensive statistical report."""
+        total_assets = len(assets)
+        total_vulns = len(vulns)
+        unique_ips = len(set(rec['目的IP'] for rec in assets + vulns if rec['目的IP']))
+
+        report = {
+            'summary': {
+                'total_assets': total_assets,
+                'total_vulnerabilities': total_vulns,
+                'unique_ips': unique_ips,
+            },
+            'asset_subnets': self.subnet_distribution(assets),
+            'vuln_subnets': self.subnet_distribution(vulns),
+            'asset_ports': self.port_distribution(assets),
+            'vuln_ports': self.port_distribution(vulns),
+            'top_asset_ips': dict(sorted(self.ip_distribution(assets).items(),
+                                         key=lambda x: x[1], reverse=True)[:10]),
+            'top_vuln_ips': dict(sorted(self.ip_distribution(vulns).items(),
+                                        key=lambda x: x[1], reverse=True)[:10]),
+        }
+        return report
+
+
+# ---------------------------------------------------------------------------
+# Data Exporter
+# ---------------------------------------------------------------------------
+class DataExporter:
+    """Exports parsed records to various formats."""
+
+    @staticmethod
+    def _deduplicate_and_sort(records: List[Dict[str, str]]) -> pd.DataFrame:
+        """Remove duplicates and sort, matching original behavior."""
+        if not records:
+            return pd.DataFrame()
+        df = pd.DataFrame(records)
+        df = df.sort_values(by=['目的IP', '目的端口'], na_position='last')
+        df = df.drop_duplicates(subset=['目的IP', '目的端口', '资产信息'], keep='first')
+        return df
+
+    def export(self, assets: List[Dict], vulns: List[Dict],
+               base_name: str, output_format: str = 'excel') -> List[str]:
+        """
+        Export assets and vulns to separate files.
+        Returns list of generated file paths.
+        """
+        exporter_func = getattr(self, f'_export_{output_format}', None)
+        if exporter_func is None:
+            raise ExportError(f"Unsupported output format: {output_format}")
+
+        generated = []
+        df_assets = self._deduplicate_and_sort(assets)
+        df_vulns = self._deduplicate_and_sort(vulns)
+
+        for prefix, df in [('assets', df_assets), ('vulns', df_vulns)]:
+            if df.empty:
+                logging.getLogger(__name__).info(f"No {prefix} data to export.")
+                continue
+            output_path = f"{base_name}_{prefix}.{self._get_extension(output_format)}"
+            exporter_func(df, output_path)
+            generated.append(output_path)
+        return generated
+
+    @staticmethod
+    def _get_extension(fmt: str) -> str:
+        mapping = {'excel': 'xlsx', 'csv': 'csv', 'json': 'json', 'txt': 'txt'}
+        return mapping.get(fmt, 'xlsx')
+
+    @staticmethod
+    def _export_excel(df: pd.DataFrame, path: str) -> None:
+        df.to_excel(path, index=False)
+
+    @staticmethod
+    def _export_csv(df: pd.DataFrame, path: str) -> None:
+        df.to_csv(path, index=False, encoding='utf-8-sig')
+
+    @staticmethod
+    def _export_json(df: pd.DataFrame, path: str) -> None:
+        data = df.to_dict(orient='records')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _export_txt(df: pd.DataFrame, path: str) -> None:
+        with open(path, 'w', encoding='utf-8') as f:
+            for _, row in df.iterrows():
+                f.write(str(row.to_dict()) + '\n')
+
+
+# ---------------------------------------------------------------------------
+# Main Application Orchestrator
+# ---------------------------------------------------------------------------
+class Application:
+    """Coordinates batch processing, caching, reporting, and output."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.logger = logging.getLogger('FscanParserApp')
+        self._setup_logging()
+
+        # Build filter rule from arguments (if provided via config or CLI)
+        self.filter_rule = self._build_filter_rule()
+        self.cache_manager = CacheManager(Path(args.cache_dir)) if not args.no_cache else None
+        self.parser = FscanParser(filter_rule=self.filter_rule)
+        self.exporter = DataExporter()
+        self.reporter = ReportGenerator()
+
+    def _setup_logging(self):
+        """Configure logging based on verbosity and optional log file."""
+        level = logging.DEBUG if self.args.verbose else logging.INFO
+        handlers = [logging.StreamHandler(sys.stdout)]
+        if self.args.log_file:
+            handlers.append(logging.FileHandler(self.args.log_file, encoding='utf-8'))
+        logging.basicConfig(level=level, format=LOG_FORMAT, handlers=handlers)
+
+    def _build_filter_rule(self) -> Optional[FilterRule]:
+        """Create a FilterRule from CLI arguments or config file."""
+        # For simplicity, we support only CLI arguments; config file support can be added similarly.
+        rule = FilterRule(
+            include_subnets=self.args.include_subnet or None,
+            exclude_subnets=self.args.exclude_subnet or None,
+            include_ports=self.args.include_port or None,
+            exclude_ports=self.args.exclude_port or None,
+            include_types=self.args.include_type or None,
+            exclude_types=self.args.exclude_type or None,
+        )
+        # If no filter is active, return None for performance
+        if (not rule.include_subnets and not rule.exclude_subnets and
+            not rule.include_ports and not rule.exclude_ports and
+            not rule.include_types and not rule.exclude_types):
+            return None
+        return rule
+
+    def _collect_input_files(self) -> List[Path]:
+        """Resolve input files/directories to a list of file paths."""
+        paths = []
+        for input_path in self.args.input:
+            p = Path(input_path)
+            if p.is_file():
+                paths.append(p)
+            elif p.is_dir():
+                # Recursively find all files (optionally filter by extension)
+                for root, _, files in os.walk(p):
+                    for f in files:
+                        if self.args.ext_filter:
+                            if any(f.endswith(ext) for ext in self.args.ext_filter):
+                                paths.append(Path(root) / f)
+                        else:
+                            paths.append(Path(root) / f)
+            else:
+                self.logger.warning(f"Input path not found: {input_path}")
+        return paths
+
+    def _process_single_file(self, file_path: Path) -> Tuple[List, List, Dict]:
+        """Process one file, using cache if enabled."""
+        # Attempt cache load
+        if self.cache_manager:
+            cached = self.cache_manager.load(file_path)
+            if cached:
+                self.logger.info(f"Loaded cached results for {file_path}")
+                return cached
+
+        assets, vulns = self.parser.parse_file(file_path)
+        report = self.reporter.generate_full_report(assets, vulns)
+        data = (assets, vulns, report)
+
+        if self.cache_manager:
+            self.cache_manager.save(file_path, data)
+        return data
+
+    def run(self) -> int:
+        """Main execution entry point."""
+        start_time = time.time()
+        input_files = self._collect_input_files()
+        if not input_files:
+            self.logger.error("No valid input files found.")
+            return 1
+
+        self.logger.info(f"Processing {len(input_files)} file(s)...")
+        all_assets = []
+        all_vulns = []
+        combined_report = {'files': {}}
+
+        for idx, file_path in enumerate(input_files, 1):
+            self.logger.info(f"[{idx}/{len(input_files)}] {file_path}")
+            try:
+                assets, vulns, report = self._process_single_file(file_path)
+                all_assets.extend(assets)
+                all_vulns.extend(vulns)
+                combined_report['files'][str(file_path)] = report
+            except ParseError as e:
+                self.logger.error(f"Skipping {file_path}: {e}")
+                continue
+
+        if not all_assets and not all_vulns:
+            self.logger.warning("No data extracted from any file.")
+            return 0
+
+        # Generate overall report
+        overall_report = self.reporter.generate_full_report(all_assets, all_vulns)
+        combined_report['overall'] = overall_report
+
+        # Save report if requested
+        if self.args.report_file:
+            report_path = self.args.report_file
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump(combined_report, f, ensure_ascii=False, indent=2)
+            self.logger.info(f"Detailed report saved to {report_path}")
+
+        # Preview in console
+        if not self.args.no_preview:
+            self._print_preview(overall_report)
+
+        # Export data
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_out = self.args.output or f"fscan_result_{timestamp}"
+        export_format = self.args.format or DEFAULT_OUTPUT_FORMAT
+        try:
+            generated_files = self.exporter.export(
+                all_assets, all_vulns, base_out, export_format
+            )
+            self.logger.info(f"Exported files: {', '.join(generated_files)}")
+        except ExportError as e:
+            self.logger.error(f"Export failed: {e}")
+            return 1
+
+        elapsed = time.time() - start_time
+        self.logger.info(f"All done in {elapsed:.2f}s.")
+        return 0
+
+    @staticmethod
+    def _print_preview(report: Dict) -> None:
+        """Print a summary preview to console."""
+        summary = report.get('summary', {})
+        print("\n" + "=" * 50)
+        print("   FSCAN RESULT PREVIEW")
+        print("=" * 50)
+        print(f"  Total assets:          {summary.get('total_assets', 0)}")
+        print(f"  Total vulnerabilities: {summary.get('total_vulnerabilities', 0)}")
+        print(f"  Unique IPs:            {summary.get('unique_ips', 0)}")
+        print("=" * 50 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# CLI Argument Setup
+# ---------------------------------------------------------------------------
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Fscan Result Parser - Enhanced Edition",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # Required or positional
+    parser.add_argument('input', nargs='+', help='Input file(s) or directory containing fscan results')
+    # Output options
+    parser.add_argument('-o', '--output', help='Base name for output files (without extension)')
+    parser.add_argument('-f', '--format', choices=SUPPORTED_OUTPUT_FORMATS,
+                        default=DEFAULT_OUTPUT_FORMAT, help='Output format')
+    # Filtering
+    parser.add_argument('--include-subnet', nargs='*', help='Only include IPs in these subnets (CIDR)')
+    parser.add_argument('--exclude-subnet', nargs='*', help='Exclude IPs in these subnets')
+    parser.add_argument('--include-port', nargs='*', help='Only include records with these ports (e.g., 80 443)')
+    parser.add_argument('--exclude-port', nargs='*', help='Exclude records with these ports')
+    parser.add_argument('--include-type', nargs='*', choices=['[*]', '[+]'],
+                        help='Include only asset type (e.g., [*] for assets, [+] for vulns)')
+    parser.add_argument('--exclude-type', nargs='*', choices=['[*]', '[+]'],
+                        help='Exclude specific asset type')
+    # Caching
+    parser.add_argument('--no-cache', action='store_true', help='Disable caching')
+    parser.add_argument('--cache-dir', default=str(CACHE_DIR_DEFAULT), help='Cache directory path')
+    # Reporting
+    parser.add_argument('--report-file', help='Save detailed JSON report to file')
+    parser.add_argument('--no-preview', action='store_true', help='Do not print summary preview')
+    # Logging
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--log-file', help='Log file path (if not set, logs to console only)')
+    # Input filtering
+    parser.add_argument('--ext-filter', nargs='*', default=['.txt', '.log', '.out'],
+                        help='File extensions to consider when scanning directories')
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+def main():
+    parser = build_argument_parser()
+    args = parser.parse_args()
+
+    app = Application(args)
+    exit_code = app.run()
+    sys.exit(exit_code)
+
+
+if __name__ == '__main__':
+    main()
